@@ -11,6 +11,7 @@ import datetime
 import numpy as np
 import time
 import torch
+import torch.onnx
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import json
@@ -202,6 +203,47 @@ def get_args_parser():
     return parser
 
 def main(args):
+    model = create_model(
+        args.model,
+        pretrained=False,
+        num_classes=args.nb_classes,
+        drop_path_rate=args.drop_path,
+        layer_scale_init_value=args.layer_scale_init_value,
+        head_init_scale=args.head_init_scale,
+        )
+
+    args.finetune = '/home/anandj/data/hive/convnext/convnext_base_1k_384.pth'
+    if args.finetune:
+        if args.finetune.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.finetune, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.finetune, map_location='cpu')
+
+        print("Load ckpt from %s" % args.finetune)
+        checkpoint_model = None
+        for model_key in args.model_key.split('|'):
+            if model_key in checkpoint:
+                checkpoint_model = checkpoint[model_key]
+                print("Load state_dict by model_key = %s" % model_key)
+                break
+        if checkpoint_model is None:
+            checkpoint_model = checkpoint
+        state_dict = model.state_dict()
+        for k in ['head.weight', 'head.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
+        utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+        print("DONE")
+    print(model)
+
+
+    x = torch.randn(1, 3, 384, 384, requires_grad=True)
+    torch.onnx.export(model, x, "convnext.onnx", export_params=True, opset_version=11, do_constant_folding=True, input_names = ['input'], output_names = ['output'], dynamic_axes={'input' : {0 : 'batch_size'}, 'output' : {0 : 'batch_size'}})
+
+    exit(0)
+
     utils.init_distributed_mode(args)
     print(args)
     device = torch.device(args.device)
@@ -275,38 +317,7 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-    model = create_model(
-        args.model, 
-        pretrained=False, 
-        num_classes=args.nb_classes, 
-        drop_path_rate=args.drop_path,
-        layer_scale_init_value=args.layer_scale_init_value,
-        head_init_scale=args.head_init_scale,
-        )
 
-    if args.finetune:
-        if args.finetune.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.finetune, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
-
-        print("Load ckpt from %s" % args.finetune)
-        checkpoint_model = None
-        for model_key in args.model_key.split('|'):
-            if model_key in checkpoint:
-                checkpoint_model = checkpoint[model_key]
-                print("Load state_dict by model_key = %s" % model_key)
-                break
-        if checkpoint_model is None:
-            checkpoint_model = checkpoint
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
-        utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
-    model.to(device)
 
     model_ema = None
     if args.model_ema:
